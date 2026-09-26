@@ -37,6 +37,7 @@ annotation stays a manual item when its old rule is re-run.
 from __future__ import annotations
 
 from copy import deepcopy
+from heapq import heappop, heappush
 
 SEG_KEY = "segments"
 ANN_KEY = "annotations"
@@ -248,38 +249,169 @@ def _identity_conflict(kind, item_id, base, a, b, ctype):
 
 
 def _interval_clusters(a_added, b_added):
-    """Connected components of the bipartite overlap graph."""
-    adj_a = {i: set() for i in range(len(a_added))}
-    adj_b = {j: set() for j in range(len(b_added))}
-    for i, a in enumerate(a_added):
-        for j, b in enumerate(b_added):
-            if _overlap(a, b):
-                adj_a[i].add(j)
-                adj_b[j].add(i)
+    """Connected components of the bipartite overlap graph.
 
-    seen_a, seen_b = set(), set()
-    clusters = []
-    for start_i in range(len(a_added)):
-        if start_i in seen_a or not adj_a[start_i]:
-            continue
-        a_ids, b_ids = set(), set()
-        stack = [("a", start_i)]
-        while stack:
-            side, idx = stack.pop()
-            if side == "a":
-                if idx in seen_a:
-                    continue
-                seen_a.add(idx)
-                a_ids.add(idx)
-                stack.extend(("b", j) for j in adj_a[idx])
+    Sweep-line over the time axis: intervals are processed in start-time
+    order (equal starts form one batch) and only the state still needed to
+    grow components is kept — each open component's member lists plus its
+    latest A-side / B-side end, indexed in two heaps.  A new interval joins
+    exactly the components whose opposite-side end lies past its start, so
+    a dense overlap region costs O(log n) per interval instead of comparing
+    every A/B pair and storing every overlap edge.  The semantics are
+    unchanged: half-open overlap (:func:`_overlap`), touching endpoints
+    never connect, same-side overlaps never connect, and cross-side chains
+    land in one cluster.  The returned clusters are ordered by their
+    smallest A-side index with both sides' indices ascending, exactly as
+    the pairwise construction produced.
+    """
+    if not a_added or not b_added:
+        return []
+
+    # (start, side, index) — side 0 = A, 1 = B; equal starts are processed
+    # as one batch so same-start cross-side overlaps are judged exactly.
+    events = [(x["start"], 0, i) for i, x in enumerate(a_added)]
+    events += [(x["start"], 1, j) for j, x in enumerate(b_added)]
+    events.sort(key=lambda e: e[0])
+
+    NEG_INF = float("-inf")
+    comps = []   # cid -> [maxAEnd, maxBEnd, aMembers, bMembers] or None
+    heap_a = []  # (-maxAEnd, cid): components a new B interval may join
+    heap_b = []  # (-maxBEnd, cid): components a new A interval may join
+
+    def _sweep(heap, side, s):
+        """Pop the live components whose side-``side`` end passes ``s``."""
+        hit = []
+        while heap:
+            neg_end, cid = heap[0]
+            if -neg_end <= s:
+                break
+            heappop(heap)
+            comp = comps[cid]
+            # skip entries of absorbed components or superseded end values
+            if comp is not None and comp[side] == -neg_end:
+                hit.append(cid)
+        return hit
+
+    pos = 0
+    while pos < len(events):
+        s = events[pos][0]
+        batch_a, batch_b = [], []
+        while pos < len(events) and events[pos][0] == s:
+            _, side, idx = events[pos]
+            (batch_a if side == 0 else batch_b).append(idx)
+            pos += 1
+
+        # An interval starting at s strictly overlaps an opposite-side
+        # member m iff m.end > s: every component member comes from an
+        # earlier batch, so m.start < s <= the interval's end already
+        # holds (zero-length intervals included).
+        join_a = _sweep(heap_b, 1, s) if batch_a else []
+        join_b = _sweep(heap_a, 0, s) if batch_b else []
+        popped_from_a = set(join_b)  # heap_a entries removed this batch
+        popped_from_b = set(join_a)  # heap_b entries removed this batch
+
+        # Union everything this batch connects: every A interval joins
+        # every join_a component, every B interval joins every join_b
+        # component, and same-batch A/B pairs both ending past s overlap.
+        parent = {}
+
+        def find(x):
+            root = x
+            while parent[root] != root:
+                root = parent[root]
+            while parent[x] != root:
+                parent[x], x = root, parent[x]
+            return root
+
+        def union(x, y):
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[rx] = ry
+
+        for cid in join_a + join_b:
+            parent.setdefault(("c", cid), ("c", cid))
+        for i in batch_a:
+            parent.setdefault(("a", i), ("a", i))
+        for j in batch_b:
+            parent.setdefault(("b", j), ("b", j))
+        if join_a:
+            hub = ("c", join_a[0])
+            for cid in join_a[1:]:
+                union(hub, ("c", cid))
+            for i in batch_a:
+                union(hub, ("a", i))
+        if join_b:
+            hub = ("c", join_b[0])
+            for cid in join_b[1:]:
+                union(hub, ("c", cid))
+            for j in batch_b:
+                union(hub, ("b", j))
+        wide_a = [i for i in batch_a if a_added[i]["end"] > s]
+        wide_b = [j for j in batch_b if b_added[j]["end"] > s]
+        if wide_a and wide_b:
+            # same-batch cross-side clique: all pairs ending past s overlap
+            root_a = ("c", join_a[0]) if join_a else ("a", wide_a[0])
+            if not join_a:
+                for i in wide_a[1:]:
+                    union(root_a, ("a", i))
+            root_b = ("c", join_b[0]) if join_b else ("b", wide_b[0])
+            if not join_b:
+                for j in wide_b[1:]:
+                    union(root_b, ("b", j))
+            union(root_a, root_b)
+
+        # Materialize each connected group as a single component.
+        groups = {}
+        for cid in join_a + join_b:
+            groups.setdefault(find(("c", cid)), [[], [], []])[0].append(cid)
+        for i in batch_a:
+            groups.setdefault(find(("a", i)), [[], [], []])[1].append(i)
+        for j in batch_b:
+            groups.setdefault(find(("b", j)), [[], [], []])[2].append(j)
+
+        for cids, ais, bis in groups.values():
+            max_a_end = max([comps[c][0] for c in cids]
+                            + [a_added[i]["end"] for i in ais] + [NEG_INF])
+            max_b_end = max([comps[c][1] for c in cids]
+                            + [b_added[j]["end"] for j in bis] + [NEG_INF])
+            if not cids and max(max_a_end, max_b_end) <= s:
+                continue  # zero-length singleton: can never gain a partner
+            if cids:
+                # The largest component survives and absorbs the rest, so
+                # member lists move O(log n) times per interval overall.
+                keep = max(cids,
+                           key=lambda c: len(comps[c][2]) + len(comps[c][3]))
+                comp = comps[keep]
+                old_a_end, old_b_end = comp[0], comp[1]
+                for c in cids:
+                    if c == keep:
+                        continue
+                    comp[2].extend(comps[c][2])
+                    comp[3].extend(comps[c][3])
+                    comps[c] = None
+                comp[2].extend(ais)
+                comp[3].extend(bis)
+                comp[0], comp[1] = max_a_end, max_b_end
+                # Re-index the survivor: entries popped above are gone and
+                # grown end values supersede the ones still in the heaps.
+                if keep in popped_from_a or max_a_end != old_a_end:
+                    heappush(heap_a, (-max_a_end, keep))
+                if keep in popped_from_b or max_b_end != old_b_end:
+                    heappush(heap_b, (-max_b_end, keep))
             else:
-                if idx in seen_b:
-                    continue
-                seen_b.add(idx)
-                b_ids.add(idx)
-                stack.extend(("a", i) for i in adj_b[idx])
-        clusters.append((sorted(a_ids), sorted(b_ids)))
-    return clusters
+                cid = len(comps)
+                comps.append([max_a_end, max_b_end, list(ais), list(bis)])
+                if max_a_end != NEG_INF:
+                    heappush(heap_a, (-max_a_end, cid))
+                if max_b_end != NEG_INF:
+                    heappush(heap_b, (-max_b_end, cid))
+
+    clusters = [comp for comp in comps
+                if comp is not None and comp[2] and comp[3]]
+    # Output contract of the pairwise construction: clusters ordered by
+    # smallest A-side index, each side's indices ascending.
+    clusters.sort(key=lambda comp: min(comp[2]))
+    return [(sorted(comp[2]), sorted(comp[3])) for comp in clusters]
 
 
 def analyze(base_doc, a_doc, b_doc):

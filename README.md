@@ -651,6 +651,24 @@ JSON 消费方）。重新导入导出的 JSON 时，这些校注按普通校注
 自定义合并值在服务端校验：时间必须为非负数字、`end >= start`、片段文本非空；
 `ruleSlot` 必须是整数，显式置空的 `color` 归一为默认颜色。
 
+**新增校注重叠分组的性能（扫描线实现）**：两侧新增校注的重叠分组——即
+区间重叠冲突的来源——按**时间边界扫描线**计算：校注按开始时间分批处理，
+每个仍未封闭的连通分组只保留其成员与两侧最晚结束时间（两个堆索引），
+新校注仅与「对侧结束时间晚于其开始时间」的分组比较并即时归并，不再
+逐对比较两侧全部新增校注，也不再保存全部重叠边。密集重叠场景（如双方
+在同一时段各新增成百上千条校注）下，比较次数与内存占用从两侧数量乘积级
+降为近线性（约 O((n+m) log(n+m))），而合并结果完全不变：仍按**半开区间**
+判定相交（端点相接不冲突）、**同侧重叠不连接**、跨侧重叠链归入同一冲突，
+冲突 ID（`annotations:interval:N:锚点ID`）、组内记录顺序、统计与裁决行为
+均与逐对比较的实现一致。使用边界：
+
+- 分组假定校注时间为可比较的数字且 `end >= start`（应用内产生的数据与
+  自定义裁决校验均保证；`end < start` 的非法输入不在契约内）；
+- 零长度校注（`start == end`）只有被另一侧区间**严格包住**才算重叠，
+  两个零长度区间永不重叠（与逐对比较的语义一致）；
+- 性能收益只在**大量新增校注密集重叠**时显著，常规规模文档无可见差异；
+  本改造为纯算法替换、无新增依赖，Docker Compose 一键启动方式不变。
+
 导出 / 合并的 JSON 结构：
 
 ```json
@@ -1305,7 +1323,8 @@ npm run dev
 
 ```bash
 cd backend
-python -m pytest test_merge.py test_rules_api.py test_quality.py \
+python -m pytest test_merge.py test_merge_interval_clusters.py \
+  test_rules_api.py test_quality.py \
   test_quality_api.py test_quality_scans_api.py test_quotes_api.py \
   test_speakers_api.py test_excerpts_api.py test_public_transcript_api.py \
   test_coverage_api.py test_corrections_api.py test_project_version_api.py -q
@@ -1321,7 +1340,12 @@ npm test
 
 测试覆盖：互不重叠改动自动合并、同字段/不同字段冲突、字段级裁决、
 修改/删除冲突、区间重叠与重叠链聚类、端点相接不冲突、自定义值校验、
-增删混合与时间排序等 14 个合并用例；以及规则预览、批量应用、重跑只更新
+增删混合与时间排序等 14 个合并用例；**区间重叠分组扫描线**另有专项
+用例（`test_merge_interval_clusters.py`）：端点相接不连接、同侧重叠
+不连接、跨侧链式归并、晚到区间桥接两个连通分组、零长度校注的严格
+包含判定、同开始时间批次处理、冲突 ID 与组内记录顺序契约、与逐对
+比较参考实现的随机输入等价性，以及密集重叠场景下无乘积级比较的
+耗时上界；以及规则预览、批量应用、重跑只更新
 本规则结果、手工编辑/删除保护、撤销（含 409）、删除规则解链、项目级联
 删除等端到端 API 用例（`test_rules_api.py`，依赖 `httpx` 提供
 TestClient）；**质检引擎**另有 16 个扫描线算法单测（越界首尾 / 内部空隙 /
@@ -1399,6 +1423,7 @@ TestClient）；**质检引擎**另有 16 个扫描线算法单测（越界首�
 │   │   ├── db.py            # SQLite 持久化（项目 / 规则 / 应用记录 / 质检扫描历史 / 说话人归一与错词校正事务；文档版本指纹与锁内比对保存）
 │   │   └── schemas.py       # Pydantic 模型
 │   ├── test_merge.py        # 合并算法测试
+│   ├── test_merge_interval_clusters.py  # 新增校注重叠分组扫描线测试（等价性 / 密集场景耗时）
 │   ├── test_rules_api.py    # 规则模块端到端 API 测试
 │   ├── test_quality.py      # 质检引擎扫描线单测
 │   ├── test_quality_api.py  # 质检端到端 API 测试
