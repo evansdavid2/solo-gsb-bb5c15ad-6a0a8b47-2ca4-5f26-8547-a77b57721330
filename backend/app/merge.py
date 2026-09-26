@@ -8,8 +8,9 @@ edit offline, and their copies are merged:
 * when both sides change the same item differently -> ``identity`` conflict;
 * modify-vs-delete of the same item -> ``identity`` conflict;
 * annotations independently added by the two sides whose intervals overlap
-  are grouped (connected components of the overlap graph) into one
-  ``interval`` conflict;
+  are grouped (connected components of the bipartite overlap graph, found
+  by a coordinate sweep with a union-find — see
+  :func:`_interval_clusters`) into one ``interval`` conflict;
 * each conflict is adjudicated per item; resolutions may pick a side,
   supply a custom value, drop the item(s), or (interval only) keep all.
 
@@ -248,37 +249,186 @@ def _identity_conflict(kind, item_id, base, a, b, ctype):
 
 
 def _interval_clusters(a_added, b_added):
-    """Connected components of the bipartite overlap graph."""
-    adj_a = {i: set() for i in range(len(a_added))}
-    adj_b = {j: set() for j in range(len(b_added))}
-    for i, a in enumerate(a_added):
-        for j, b in enumerate(b_added):
-            if _overlap(a, b):
-                adj_a[i].add(j)
-                adj_b[j].add(i)
+    """Connected components of the bipartite overlap graph.
 
-    seen_a, seen_b = set(), set()
-    clusters = []
-    for start_i in range(len(a_added)):
-        if start_i in seen_a or not adj_a[start_i]:
-            continue
-        a_ids, b_ids = set(), set()
-        stack = [("a", start_i)]
-        while stack:
-            side, idx = stack.pop()
-            if side == "a":
-                if idx in seen_a:
-                    continue
-                seen_a.add(idx)
-                a_ids.add(idx)
-                stack.extend(("b", j) for j in adj_a[idx])
-            else:
-                if idx in seen_b:
-                    continue
-                seen_b.add(idx)
-                b_ids.add(idx)
-                stack.extend(("a", i) for i in adj_b[idx])
-        clusters.append((sorted(a_ids), sorted(b_ids)))
+    Two independently added annotations are linked exactly when their
+    half-open intervals ``[start, end)`` intersect (endpoint touching is
+    not an overlap — :func:`_overlap`), and only *cross-side* links are
+    edges: annotations added on the same side never connect by themselves,
+    but a cross-side chain (A₁–B₁–A₂–…) collapses every annotation on it
+    into one conflict group.
+
+    The implementation is a coordinate sweep with a union-find instead of
+    the naive all-pairs comparison, and no adjacency edges are stored:
+    densely overlapping sides cost ``O(n log n)`` time and ``O(n)`` state
+    rather than ``|A| × |B|`` comparisons / edges.  Events are interval
+    starts processed per coordinate.  Each side's active list keeps at
+    most one live representative ``(node, end)`` per connected component;
+    a list is scanned only when the *other* side starts an interval at the
+    current coordinate (an "opposite touch"): expired representatives
+    (``end <= t``) are dropped then, and every remaining representative
+    overlaps every interval starting at ``t`` with ``end >= t`` — that is
+    precisely the set of cross-side edges needed to maintain connectivity,
+    so a single anchor per touching side absorbs them all.  After a touch
+    the scanned list collapses to one representative per merged component,
+    which keeps total scan work linear in the number of intervals.
+    Zero-length point intervals (``start == end``) connect to components
+    already live at their point but never to intervals merely starting /
+    ending there (half-open semantics), and are not retained as
+    representatives.  Groups are emitted in the same order as the prior
+    pairwise implementation (by lowest A-side input index) with member
+    indices sorted, so conflict ids / anchors / item order are unchanged.
+
+    Boundary: annotations are time intervals with ``start <= end``;
+    negative-length inputs are not meaningful anywhere in the application
+    and are ignored by the sweep.
+    """
+    na, nb = len(a_added), len(b_added)
+    total = na + nb
+    parent = list(range(total))
+    weight = [1] * total
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(x, y):
+        rx, ry = find(x), find(y)
+        if rx == ry:
+            return
+        if weight[rx] < weight[ry]:
+            rx, ry = ry, rx
+        parent[ry] = rx
+        weight[rx] += weight[ry]
+
+    # Events are starts only: ends take effect lazily when a list is next
+    # scanned (representatives with end <= t are dropped), so an end at t
+    # is removed before a start at t links — touching never connects.
+    # Node ids: A i -> i, B j -> na + j.
+    events = []
+    node_end = {}
+    for i, it in enumerate(a_added):
+        events.append((it["start"], 0, i))
+        node_end[i] = it["end"]
+    for j, it in enumerate(b_added):
+        events.append((it["start"], 1, na + j))
+        node_end[na + j] = it["end"]
+    events.sort(key=lambda e: (e[0], e[2]))
+
+    # Live representatives per side: parallel node / end lists, at most one
+    # node per union-find component.  Lists are touched (pruned + rebuilt)
+    # only on boundaries where the other side has a starting interval.
+    live_nodes = [[], []]
+    live_ends = [[], []]
+
+    def absorb(touchers, survivors):
+        """Merge every toucher and every survivor into one component.
+
+        All touchers (intervals starting at t with end >= t) overlap every
+        surviving representative (started earlier, end > t) by the
+        half-open predicate, so unioning through one anchor is the same
+        connectivity as every cross-side pair.
+        """
+        anchor = touchers[0]
+        for node in survivors:
+            union(anchor, node)
+        for node in touchers[1:]:
+            union(anchor, node)
+
+    def prune(side, t):
+        """Drop representatives expired at/before t; return survivors."""
+        nodes, ends = live_nodes[side], live_ends[side]
+        k = 0
+        for idx in range(len(nodes)):
+            if ends[idx] > t:
+                nodes[k], ends[k] = nodes[idx], ends[idx]
+                k += 1
+        del nodes[k:], ends[k:]
+        return nodes
+
+    def rebuild(side, t, fresh):
+        """Fold freshly started intervals in; one max-end rep per component."""
+        nodes, ends = live_nodes[side], live_ends[side]
+        best = {}
+        for idx in range(len(nodes)):
+            root = find(nodes[idx])
+            if ends[idx] > t and (root not in best or ends[idx] > best[root][0]
+                                  or (ends[idx] == best[root][0]
+                                      and nodes[idx] < best[root][1])):
+                best[root] = (ends[idx], nodes[idx])
+        for node in fresh:
+            end = node_end[node]
+            root = find(node)
+            if end > t and (root not in best or end > best[root][0]
+                            or (end == best[root][0] and node < best[root][1])):
+                best[root] = (end, node)
+        live_nodes[side] = [node for end, node in best.values()]
+        live_ends[side] = [end for end, node in best.values()]
+
+    pos = 0
+    while pos < total:
+        t = events[pos][0]
+        group = []
+        while pos < total and events[pos][0] == t:
+            group.append(events[pos])
+            pos += 1
+
+        positive = [[], []]   # nodes with end > t, per side
+        touchers = [[], []]   # positive nodes + point nodes (end == t)
+        for _start, side, node in group:
+            end = node_end[node]
+            if end < t:
+                continue  # negative-length input: out of scope, never a rep
+            touchers[side].append(node)
+            if end > t:
+                positive[side].append(node)
+
+        touched_a, touched_b = bool(touchers[0]), bool(touchers[1])
+
+        # Links against components live strictly before t.  Each side's
+        # touchers overlap exactly its opposite list's survivors.
+        surv_b = prune(1, t) if touched_a else live_nodes[1]
+        surv_a = prune(0, t) if touched_b else live_nodes[0]
+        if touched_a and surv_b:
+            absorb(touchers[0], surv_b)
+        if touched_b and surv_a:
+            absorb(touchers[1], surv_a)
+
+        # Cross-side links among intervals both starting at t: only the
+        # positive-length ones overlap (their interiors share points);
+        # point intervals merely touch them.  Every positive node of each
+        # side must join the other side's component — same-side nodes are
+        # not connected to each other on their own.
+        if positive[0] and positive[1]:
+            absorb(positive[0], positive[1])
+
+        # Fold new representatives into touched lists (untouched lists keep
+        # accumulating; they are pruned on the next opposite touch).
+        if touched_b:
+            rebuild(0, t, positive[0])
+        else:
+            live_nodes[0].extend(positive[0])
+            live_ends[0].extend(node_end[n] for n in positive[0])
+        if touched_a:
+            rebuild(1, t, positive[1])
+        else:
+            live_nodes[1].extend(positive[1])
+            live_ends[1].extend(node_end[n] for n in positive[1])
+
+    # Read connected components out of the union-find; only components with
+    # members on both sides are overlap conflicts.
+    members_a, members_b = {}, {}
+    for i in range(na):
+        members_a.setdefault(find(i), []).append(i)
+    for j in range(nb):
+        members_b.setdefault(find(na + j), []).append(j)
+
+    clusters = [(ai, members_b[root])
+                for root, ai in members_a.items() if root in members_b]
+    # Same order as the pairwise graph walk: lowest A input index first.
+    clusters.sort(key=lambda c: c[0][0])
     return clusters
 
 

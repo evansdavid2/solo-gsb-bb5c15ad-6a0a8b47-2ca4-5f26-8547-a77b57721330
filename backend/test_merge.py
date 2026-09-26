@@ -397,6 +397,115 @@ def test_interval_custom_and_keep_preserve_extras():
     assert errors == []
 
 
+# ---------- interval grouping: sweep-line connected components ----------
+
+def _pairwise_interval_clusters(a_added, b_added):
+    """Brute-force reference: every cross-side pair + explicit adjacency."""
+    from app.merge import _overlap
+    adj_a = {i: set() for i in range(len(a_added))}
+    adj_b = {j: set() for j in range(len(b_added))}
+    for i, a in enumerate(a_added):
+        for j, b in enumerate(b_added):
+            if _overlap(a, b):
+                adj_a[i].add(j)
+                adj_b[j].add(i)
+    seen_a, seen_b, clusters = set(), set(), []
+    for start_i in range(len(a_added)):
+        if start_i in seen_a or not adj_a[start_i]:
+            continue
+        a_ids, b_ids = set(), set()
+        stack = [("a", start_i)]
+        while stack:
+            side, idx = stack.pop()
+            if side == "a":
+                if idx in seen_a:
+                    continue
+                seen_a.add(idx)
+                a_ids.add(idx)
+                stack.extend(("b", j) for j in adj_a[idx])
+            else:
+                if idx in seen_b:
+                    continue
+                seen_b.add(idx)
+                b_ids.add(idx)
+                stack.extend(("a", i) for i in adj_b[idx])
+        clusters.append((sorted(a_ids), sorted(b_ids)))
+    return clusters
+
+
+def test_dense_overlapping_adds_form_single_cluster():
+    # 50 A + 50 B all inside the same band: pairwise edges would be 2500,
+    # the conflict must still be exactly one group with every item.
+    a = doc(anns=[ANN(f"a{i:02d}", 0.0, 100.0) for i in range(50)])
+    b = doc(anns=[ANN(f"b{i:02d}", 1.0, 99.0) for i in range(50)])
+    _, conflicts, _ = analyze(doc(), a, b)
+    assert len(conflicts) == 1
+    c = conflicts[0]
+    assert c["conflictType"] == "interval"
+    assert len(c["aItems"]) == 50 and len(c["bItems"]) == 50
+    # anchor: first A item in analyze's id order; id numbering unchanged
+    assert c["id"] == "annotations:interval:0:a00"
+    assert [x["id"] for x in c["aItems"]] == [f"a{i:02d}" for i in range(50)]
+    assert [x["id"] for x in c["bItems"]] == [f"b{i:02d}" for i in range(50)]
+
+
+def test_interval_clusters_numbered_by_earliest_a_item():
+    a = doc(anns=[ANN("a1", 0, 2), ANN("a2", 10, 12), ANN("a3", 20, 22)])
+    b = doc(anns=[ANN("b1", 1, 2), ANN("b2", 11, 12)])
+    _, conflicts, _ = analyze(doc(), a, b)
+    assert [c["id"] for c in conflicts] == [
+        "annotations:interval:0:a1", "annotations:interval:1:a2"]
+
+
+def test_same_side_overlaps_do_not_connect_without_cross_chain():
+    # the two A items overlap each other, but only a2 bridges to B —
+    # a1 must not be pulled into the conflict
+    a = doc(anns=[ANN("a1", 0, 2), ANN("a2", 1, 8)])
+    b = doc(anns=[ANN("b1", 3, 5)])
+    _, conflicts, _ = analyze(doc(), a, b)
+    (c,) = conflicts
+    assert [x["id"] for x in c["aItems"]] == ["a2"]
+    assert [x["id"] for x in c["bItems"]] == ["b1"]
+
+
+def test_point_intervals_follow_half_open_semantics():
+    from app.merge import _interval_clusters
+    p = lambda s, e, i: {"id": i, "start": s, "end": e}
+    # point inside the other interval -> edge
+    assert _interval_clusters([p(5, 5, "x")], [p(0, 10, "y")]) == [([0], [0])]
+    # point merely touching start/end -> no edge
+    assert _interval_clusters([p(0, 5, "x")], [p(5, 5, "y")]) == []
+    assert _interval_clusters([p(5, 5, "x")], [p(5, 10, "y")]) == []
+    # two points at the same coordinate do not connect
+    assert _interval_clusters([p(5, 5, "x")], [p(5, 5, "y")]) == []
+
+
+def test_interval_clusters_match_pairwise_reference_on_random_inputs():
+    import random
+    from app.merge import _interval_clusters
+    rnd = random.Random(4242)
+    for _ in range(400):
+        na, nb = rnd.randint(0, 8), rnd.randint(0, 8)
+
+        def make(prefix, k):
+            out = []
+            for i in range(k):
+                if rnd.random() < 0.25:   # points / touching-friendly coords
+                    s = rnd.choice([0, 1, 2, 5])
+                    e = s if rnd.random() < 0.3 else rnd.choice([0, 1, 2, 5])
+                    if e < s:
+                        s, e = e, s
+                else:
+                    s = rnd.uniform(0, 6)
+                    e = s + rnd.uniform(0, 4)
+                out.append({"id": f"{prefix}{i}", "start": s, "end": e})
+            return out
+
+        a_added, b_added = make("a", na), make("b", nb)
+        assert _interval_clusters(a_added, b_added) == \
+            _pairwise_interval_clusters(a_added, b_added)
+
+
 def test_modify_delete_choice_keeps_survivor_extras():
     base = doc(anns=[copy.deepcopy(RULE_ANN)])
     changes, conflicts, _ = analyze(
